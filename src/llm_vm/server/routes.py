@@ -6,6 +6,8 @@ import openai
 from llm_vm.agents.REBEL import agent
 from llm_vm.client import Client
 from llm_vm.config import settings
+from celery import Celery
+from flask import url_for, jsonify
 # load optimizer for endpoint use
 # optimizer = LocalOptimizer(MIN_TRAIN_EXS=2,openai_key=None)
 
@@ -14,13 +16,51 @@ client = Client( big_model=settings.big_model, small_model=settings.small_model)
 print('optimizer loaded', file=sys.stderr)
 
 bp = Blueprint('bp',__name__)
+celery = Celery(bp.name, broker='redis://localhost:6379/0')
 
 @bp.route('/', methods=['GET'])
 def home():
     return '''home'''
 
+@bp.route("/v1/status/<task_id>")
+def get_task_status(task_id):
+    task = handle_celery_task.AsyncResult()
+    if task.state == 'PENDING':
+        # job did not start yet
+        response = {
+            'state': task.state,
+            'status': 'Pending...'
+        }
+    elif task.state != 'FAILURE':
+        response = {
+            'state': task.state,
+            'info': task.info
+        }
+    else:
+        # something went wrong in the background job
+        response = {
+            'state': task.state,
+            'current': 1,
+            'total': 1,
+            'status': str(task.info),  # this is the exception raised
+        }
+    return jsonify(response)
+
 @bp.route('/v1/complete', methods=['POST'])
 def optimizing_complete():
+    task = handle_celery_task.apply_async(args=[request])
+    return { "status": 0, "resp": "task in progress", "location": url_for('v1/status', task_id=task.id) }
+
+@celery.task(bind=True)
+def handle_celery_task(self, request):
+    out = run_optimize_complete(self, request)
+    if (out["status"] == 0):
+        self.update_state(state="FAILURE", meta=out)
+    else:
+        self.update_state(state="SUCCESS", meta=out)
+
+def run_optimize_complete(celery, request):
+    celery.update_state(state="STARTED")
     rebel_agent = agent.Agent("", [], verbose=1)
     data = json.loads(request.data)
     static_context = data["context"]
